@@ -1,0 +1,56 @@
+---
+# Einzelner flacher Play, anders als deploy_haproxy.yml's Struktur mit einem Play pro
+# Tenant/Hostgruppe - Undeploy ist eine seltene, bewusste Operation, und
+# haproxy_miw_undeploy_instances/haproxy_miw_undeploy_tenants (unten) erfordern für jede
+# Wirkung ohnehin schon ein explizites einmaliges -e (siehe Assert "Undeploy-Lauf ohne
+# Wirkung verweigern") - ein Tag allein hat hier nie ausgereicht, um etwas zu löschen, die
+# Per-Tenant-Hostgruppen-Indirektion von deploy_haproxy.yml bringt also keine echte
+# Sicherheit. Das Entfernen eines conf.d-Fragments ist auf jedem Host ohne passendes Fragment
+# ein idempotenter No-op (siehe miw.haproxy.haproxy_miw README "Undeploy") - ein Lauf gegen
+# die ganze Flotte ist also standardmäßig sicher; den Blast-Radius bei Bedarf mit
+# --limit <host> eingrenzen.
+#
+# Kein Import von checkout_tenant_config.yml hier - Undeploy liest nie eine Tenant-YAML:
+# Tenant-/Instanz-Identität wird direkt über die Extra-Vars
+# haproxy_miw_undeploy_instances/haproxy_miw_undeploy_tenants übergeben, was auch dann noch
+# funktioniert, wenn die Quell-YAML in tenant-config-haproxy bereits gelöscht wurde - der
+# übliche Grund, etwas zu undeployen.
+#
+# Beide Extra-Vars sind bewusst nur einmalig per `-e`, genau wie
+# haproxy_miw_instances/haproxy_miw_tenant_folders für deploy_haproxy.yml - nie von hier oder
+# aus host_vars gesteuert, siehe README "Undeploy".
+- name: HAProxy undeployen
+  hosts: haproxy_miws
+  become: true
+  tasks:
+    - name: "Undeploy-Lauf ohne Wirkung verweigern (weder haproxy_miw_undeploy_instances noch haproxy_miw_undeploy_tenants gesetzt)"
+      ansible.builtin.assert:
+        that:
+          - (haproxy_miw_undeploy_instances | default([]) | length > 0) or (haproxy_miw_undeploy_tenants | default([]) | length > 0)
+        fail_msg: >-
+          haproxy_miw_undeploy_instances (Liste von {tenant, instance}) und/oder
+          haproxy_miw_undeploy_tenants (Liste von Tenant-Namen) als einmalige -e-Extra-Vars
+          für {{ inventory_hostname }} übergeben - siehe README "Undeploy".
+
+    - name: Explizit benannte Instanzen undeployen
+      ansible.builtin.include_role:
+        name: miw.haproxy.haproxy_miw
+        tasks_from: undeploy_instance
+      vars:
+        haproxy_miw_undeploy_tenant: "{{ haproxy_miw_undeploy_item.tenant }}"
+        haproxy_miw_undeploy_instance: "{{ haproxy_miw_undeploy_item.instance }}"
+      loop: "{{ haproxy_miw_undeploy_instances | default([]) }}"
+      loop_control:
+        loop_var: haproxy_miw_undeploy_item
+        label: "{{ haproxy_miw_undeploy_item.tenant }}/{{ haproxy_miw_undeploy_item.instance }}"
+
+    - name: Explizit benannte Tenants vollständig undeployen
+      ansible.builtin.include_role:
+        name: miw.haproxy.haproxy_miw
+        tasks_from: undeploy_tenant
+      vars:
+        haproxy_miw_undeploy_tenant: "{{ haproxy_miw_undeploy_tenant_item }}"
+      loop: "{{ haproxy_miw_undeploy_tenants | default([]) }}"
+      loop_control:
+        loop_var: haproxy_miw_undeploy_tenant_item
+        label: "{{ haproxy_miw_undeploy_tenant_item }}"

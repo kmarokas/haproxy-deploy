@@ -1,0 +1,73 @@
+---
+# Gemeinsamer Teil für jeden Tenant-Play in deploy_haproxy.yml. Löst die effektive
+# Instanzliste für den/die Tenant(s) dieses Plays auf, prüft sie per Pre-Flight-Check 
+# auf Bind-Kollisionen und rendert die Konfiguration pro Instanz.
+
+- name: Umgebungswert haproxy_miw_deploy_stage aus dem Inventory prüfen
+  ansible.builtin.assert:
+    that:
+      - haproxy_miw_deploy_stage | default(false) is truthy
+    fail_msg: >-
+      haproxy_miw_deploy_stage ist für {{ inventory_hostname }} nicht gesetzt - im Inventory
+      (group_vars/all.yml) setzen, siehe README "haproxy_miw_deploy_stage".
+
+- name: Effektive Instanzliste aus explizitem haproxy_miw_instances vorbelegen
+  ansible.builtin.set_fact:
+    haproxy_miw_effective_instances: "{{ haproxy_miw_instances | default([]) }}"
+
+- name: Tenant-Ordner-Bulk-Deploy-Einträge expandieren und anhängen
+  ansible.builtin.include_tasks: tasks/expand_tenant_folder.yml
+  loop: "{{ haproxy_miw_tenant_folders | default([]) }}"
+
+- name: Effektive Instanzliste deduplizieren
+  ansible.builtin.set_fact:
+    haproxy_miw_effective_instances: "{{ haproxy_miw_effective_instances | unique }}"
+
+- name: Fortsetzen mit null aufgelösten Instanzen verweigern
+  ansible.builtin.assert:
+    that:
+      - haproxy_miw_effective_instances | length > 0
+    fail_msg: >-
+      Keine haproxy_miw_instances oder haproxy_miw_tenant_folders für
+      {{ inventory_hostname }} aufgelöst.
+
+- name: "Pre-Flight - rohes frontend.bind jeder Kandidat-Instanz laden (Kollisionscheck)"
+  # `raw_binds` wird durch denselben stages:<haproxy_miw_deploy_stage>-Overlay aufgelöst, den auch
+  # die Rolle selbst anwendet  um Kollisionscheck auf Stage aufgelöste End-Konfiguration
+  # laufen zu lassen.
+  ansible.builtin.set_fact:
+    haproxy_miw_preflight_binds: >-
+      {{ haproxy_miw_preflight_binds | default([]) + [{
+        'tenant': item.tenant,
+        'instance': item.instance,
+        'key': (raw_binds.frontend.bind.address | default('0.0.0.0')) ~ ':' ~ raw_binds.frontend.bind.port
+      }] }}
+  vars:
+    raw_binds: >-
+      {{
+        (lookup('ansible.builtin.file', tenant_config_checkout_dir ~ '/tenants/' ~ item.tenant ~ '/' ~ item.instance ~ '.yml') | from_yaml)
+        | miw.haproxy.resolve_stage(haproxy_miw_deploy_stage)
+      }}
+  loop: "{{ haproxy_miw_effective_instances }}"
+  loop_control:
+    label: "{{ item.tenant }}/{{ item.instance }}"
+
+- name: "Pre-Flight - vor jedem Rendern fehlschlagen, wenn zwei Kandidat-Instanzen sich eine Bind-Adresse:Port teilen"
+  ansible.builtin.assert:
+    that:
+      - (haproxy_miw_preflight_binds | map(attribute='key') | list | length) == (haproxy_miw_preflight_binds | map(attribute='key') | unique | list | length)
+    fail_msg: >-
+      Bind-Kollision unter den für {{ inventory_hostname }} ausgewählten Instanzen:
+      {{ haproxy_miw_preflight_binds }}. Zwei Frontends können sich keine Adresse:Port auf
+      einem haproxy-Prozess teilen. haproxy_miw_instances/haproxy_miw_tenant_folders für
+      diesen Host korrigieren.
+
+- name: Jede diesem Host zugewiesene HAProxy-Instanz rendern und anwenden
+  ansible.builtin.include_role:
+    name: miw.haproxy.haproxy_miw
+  vars:
+    haproxy_miw_customer_config_file: >-
+      {{ tenant_config_checkout_dir }}/tenants/{{ item.tenant }}/{{ item.instance }}.yml
+  loop: "{{ haproxy_miw_effective_instances }}"
+  loop_control:
+    label: "{{ item.tenant }}/{{ item.instance }}"

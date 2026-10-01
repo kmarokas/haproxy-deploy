@@ -1,0 +1,79 @@
+---
+- name: Umgebungswerte aus dem Inventory prüfen (Controller)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [always]
+  tasks:
+    - name: Pflichtwerte für den Checkout von tenant-config-haproxy prüfen
+      ansible.builtin.assert:
+        that:
+          - lookup('ansible.builtin.vars', haproxy_miw_env_var_item, default='') is truthy
+        fail_msg: >-
+          {{ haproxy_miw_env_var_item }} ist nicht gesetzt - im Inventory (group_vars/all.yml)
+          setzen, siehe README "Inventories".
+        quiet: true
+      loop:
+        - tenant_config_repo_url
+        - tenant_config_repo_ref
+        - tenant_config_checkout_dir
+      loop_control:
+        loop_var: haproxy_miw_env_var_item
+
+- name: Tenant-Konfiguration ist auf dem gepinnten Ref ausgecheckt
+  ansible.builtin.import_playbook: checkout_tenant_config.yml
+  tags: [always]
+
+# Ein Play pro Tenant-/Kunden-Gruppe. Die `hosts:`-Gruppe jedes Plays trägt den Namen des
+# Tenants, jeder Play hat ein eindeutiges Tag (Tennant/Konden-Gruppe) um nur diesen deployen zu können, und jeder Play setzt
+# haproxy_miw_tenant_folders oder haproxy_miw_instances für seine(n) Tenant(s) bzw. Kunden-Gruppe.
+
+- name: HAProxy deployen - Tenant 'acme'
+  hosts: acme
+  become: true
+  tags: [ acme ]
+  vars:
+    haproxy_miw_tenant_folders: [ acme ]
+  tasks:
+    - ansible.builtin.import_tasks: tasks/deploy_tenant_instances.yml
+
+- name: HAProxy deployen - Tenant 'contoso'
+  hosts: contoso
+  become: true
+  tags: [ contoso ]
+  vars:
+    haproxy_miw_tenant_folders: [ contoso ]
+  tasks:
+    - ansible.builtin.import_tasks: tasks/deploy_tenant_instances.yml
+
+- name: HAProxy deployen - Tenant 'cluster1'
+  hosts: cluster1
+  become: true
+  tags: [ cluster1 ]
+  vars:
+    haproxy_miw_tenant_folders: [ cluster1 ]
+  tasks:
+    - ansible.builtin.import_tasks: tasks/deploy_tenant_instances.yml
+
+- name: HAProxy deployen - Tenant 'cluster1_kunde1'
+  hosts: cluster1
+  become: true
+  tags: [ kunde1 ]
+  vars:
+    haproxy_miw_instances:
+        - tenant: cluster1
+          instance: kunde1-http
+        - tenant: cluster1
+          instance: kunde1-tcp
+  tasks:
+    - ansible.builtin.import_tasks: tasks/deploy_tenant_instances.yml
+
+
+- name: HAProxy deployen - Tenant 'shared_lb'
+  hosts: shared_lb
+  become: true
+  tags: [ shared_lb ]
+  vars:
+    haproxy_miw_tenant_folders: [ shared_lb ]
+  tasks:
+    - ansible.builtin.import_tasks: tasks/deploy_tenant_instances.yml

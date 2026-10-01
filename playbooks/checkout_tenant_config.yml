@@ -1,0 +1,12 @@
+---
+- name: tenant-config-haproxy auf den gepinnten Ref auschecken
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: tenant-config-haproxy klonen/aktualisieren
+      ansible.builtin.git:
+        repo: "{{ tenant_config_repo_url }}"
+        dest: "{{ tenant_config_checkout_dir }}"
+        version: "{{ tenant_config_repo_ref }}"
+        force: false

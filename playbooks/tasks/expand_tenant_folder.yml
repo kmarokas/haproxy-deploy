@@ -1,0 +1,13 @@
+---
+# Expandiert zu deployenden Tenant-Ordner in explizite {tenant, instance}-Einträge - 
+# einen pro *.yml-Datei im Verzeichnis dieses Tenants außer der Shared-Backends-Datei.
+- name: "Tenant-Ordner '{{ item }}' in explizite Instanz-Einträge expandieren"
+  ansible.builtin.set_fact:
+    haproxy_miw_effective_instances: >-
+      {{ haproxy_miw_effective_instances + [{'tenant': item, 'instance': (glob_item | basename | regex_replace('\.ya?ml$', ''))}] }}
+  loop: "{{ query('ansible.builtin.fileglob', tenant_config_checkout_dir ~ '/tenants/' ~ item ~ '/*.yml') }}"
+  loop_control:
+    loop_var: glob_item
+    label: "{{ glob_item | basename }}"
+  # Fallback = Rollen-Default (defaults/main.yml), da die Rolle hier noch nicht geladen ist.
+  when: (glob_item | basename) != (haproxy_miw_shared_config_basename | default('_shared.yml'))
