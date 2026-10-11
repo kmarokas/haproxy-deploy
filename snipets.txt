@@ -1,0 +1,156 @@
+main.yml
+# Default für frontend.binds[].tls.enabled, je nach lb_type - schemas/v1/normalize.yml wählt den
+# passenden vor jedem Customer-Override (siehe haproxy_miw_frontend_bind_defaults.tls unten).
+haproxy_miw_frontend_tls_enabled_http: true
+haproxy_miw_frontend_tls_enabled_tcp: false
+
+# Defaults je Eintrag in frontend.binds. Merge pro bind (Filter miw.haproxy.merge_defaults):
+# diese Rollen-Defaults -> frontend.bind_defaults -> bind.
+haproxy_miw_frontend_bind_defaults:
+  address: 0.0.0.0
+  port: 443
+  tls:
+    # Kein statisches `enabled` hier - lb_type-abhängig, siehe
+    # haproxy_miw_frontend_tls_enabled_http/_tcp oben.
+    cert_path: "{{ haproxy_miw_frontend_tls_cert_path }}"
+
+# port: Ganzzahl oder `passthrough` (Server ohne Port - Verbindung geht auf den Port, auf dem
+# der Client ankam; nur tcp_passthrough). check_port: abweichender Health-Check-Port, bei
+# port: passthrough + check: true Pflicht.
+haproxy_miw_backend_member_defaults:
+  port: 443
+  check_port: null
+  weight: 1
+  check: true
+  tls:
+    enabled: true
+    verify: true
+    cert_path: "{{ haproxy_miw_backend_tls_cert_path }}"
+
+---
+guardrails.yml
+- name: "Guardrail - frontend.binds[].tls.enabled erfordert einen gesetzten cert_path"
+  ansible.builtin.assert:
+    that:
+      - not haproxy_miw_bind_item.tls.enabled or (haproxy_miw_bind_item.tls.cert_path is string and haproxy_miw_bind_item.tls.cert_path | length > 0)
+    fail_msg: >-
+      frontend.binds[{{ haproxy_miw_bind_index }}].tls.enabled ist true, aber cert_path ist
+      leer/nicht gesetzt für {{ haproxy_miw_customer_config_file }}. tls.cert_path dieses binds
+      setzen (oder den Rollen-Default haproxy_miw_frontend_tls_cert_path überschreiben) auf einen
+      existierenden Zertifikatspfad auf dem Zielhost, oder tls.enabled: false setzen.
+  loop: "{{ haproxy_miw_model.frontend.binds }}"
+  loop_control:
+    loop_var: haproxy_miw_bind_item
+    index_var: haproxy_miw_bind_index
+    label: "{{ haproxy_miw_bind_item.address }}:{{ haproxy_miw_bind_item.port }}"
+
+# Lokale und alle Shared-Backends des Tenants (auch nicht referenzierte - die landen trotzdem im
+# Shared-Fragment). Ein referenziertes Shared-Backend wird dabei doppelt geprüft, harmlos.
+- name: "Guardrail - Member-port ist ein Port oder passthrough, check_port falls gesetzt ein Port"
+  vars:
+    # subelements liefert je Member das Paar [Backend, Member]
+    haproxy_miw_backend: "{{ haproxy_miw_member_item.0 }}"
+    haproxy_miw_member: "{{ haproxy_miw_member_item.1 }}"
+  ansible.builtin.assert:
+    that:
+      - (haproxy_miw_member.port is integer and haproxy_miw_member.port is not boolean
+          and haproxy_miw_member.port >= 1 and haproxy_miw_member.port <= 65535)
+        or haproxy_miw_member.port == 'passthrough'
+      - haproxy_miw_member.check_port is none
+        or (haproxy_miw_member.check_port is integer and haproxy_miw_member.check_port is not boolean
+          and haproxy_miw_member.check_port >= 1 and haproxy_miw_member.check_port <= 65535)
+    fail_msg: >-
+      Backend '{{ haproxy_miw_backend.name }}', Member {{ haproxy_miw_member.host }}:
+      port muss ein Port (1-65535) oder 'passthrough' sein (ist {{ haproxy_miw_member.port | to_json }}),
+      check_port, falls gesetzt, ein Port (ist {{ haproxy_miw_member.check_port | to_json }}).
+      Mehrere Frontend-Ports auf denselben Backend-Port: einen festen port setzen; Port des Clients
+      durchreichen: port: passthrough.
+  loop: "{{ ((haproxy_miw_model.backends.values() | list) + (haproxy_miw_shared_backends_model.values() | list)) | subelements('members') }}"
+  loop_control:
+    loop_var: haproxy_miw_member_item
+    label: "{{ haproxy_miw_backend.name }}/{{ haproxy_miw_member.host }}"
+
+- name: "Guardrail - port: passthrough nur in tcp-Backends und mit check_port bei aktivem check"
+  vars:
+    # subelements liefert je Member das Paar [Backend, Member]
+    haproxy_miw_backend: "{{ haproxy_miw_member_item.0 }}"
+    haproxy_miw_member: "{{ haproxy_miw_member_item.1 }}"
+  ansible.builtin.assert:
+    that:
+      - haproxy_miw_backend.mode == 'tcp'
+      - not haproxy_miw_member.check or haproxy_miw_member.check_port is not none
+    fail_msg: >-
+      Backend '{{ haproxy_miw_backend.name }}', Member {{ haproxy_miw_member.host }}:
+      port: passthrough erfordert mode: tcp am Backend (ist {{ haproxy_miw_backend.mode }}) und
+      bei check: true einen check_port - ohne festen Server-Port weiß HAProxy sonst nicht, welchen
+      Port der Health-Check prüfen soll.
+  loop: >-
+    {{ ((haproxy_miw_model.backends.values() | list) + (haproxy_miw_shared_backends_model.values() | list))
+       | subelements('members') | selectattr('1.port', 'equalto', 'passthrough') | list }}
+  loop_control:
+    loop_var: haproxy_miw_member_item
+    label: "{{ haproxy_miw_backend.name }}/{{ haproxy_miw_member.host }}"
+
+---
+validate.yml
+- name: "Reverse_proxy validate - kein referenziertes Backend mit port: passthrough"
+  ansible.builtin.assert:
+    that:
+      - haproxy_miw_backend_item.members | selectattr('port', 'equalto', 'passthrough') | list | length == 0
+    fail_msg: >-
+      Backend '{{ haproxy_miw_backend_item.name }}' hat Member mit port: passthrough - das ist nur
+      für lb_type: tcp_passthrough vorgesehen. Für reverse_proxy einen festen port setzen.
+  loop: "{{ haproxy_miw_model.backends.values() | list }}"
+  loop_control:
+    loop_var: haproxy_miw_backend_item
+    label: "{{ haproxy_miw_backend_item.name }}"
+
+---
+normalize.yml
+- name: "Normalize v1 - global/defaults/stats/frontend aus Rollen-Defaults + Overrides zusammensetzen"
+  ansible.builtin.set_fact:
+    haproxy_miw_model: >-
+      {{ haproxy_miw_model | combine({
+        'global': haproxy_miw_global_defaults | combine(haproxy_miw_shared_config.global | default({}), recursive=True),
+        'defaults': haproxy_miw_defaults_defaults | combine(haproxy_miw_shared_config.defaults | default({}), recursive=True),
+        'stats': haproxy_miw_stats_defaults
+          | combine({'password': haproxy_miw_stats_password})
+          | combine(haproxy_miw_shared_config.stats | default({}), recursive=True),
+        'frontend': haproxy_miw_frontend_defaults
+          | combine(haproxy_miw_customer_config.frontend, recursive=True)
+          | combine({'binds': haproxy_miw_customer_config.frontend.binds
+              | map('miw.haproxy.merge_defaults',
+                  haproxy_miw_frontend_bind_defaults
+                    | combine({'tls': {'enabled': (haproxy_miw_frontend_tls_enabled_http
+                        if haproxy_miw_customer_config.lb_type == 'reverse_proxy'
+                        else haproxy_miw_frontend_tls_enabled_tcp)}}, recursive=True),
+                  (haproxy_miw_customer_config.frontend.bind_defaults | default({})))
+              | list})
+      }) }}
+
+---
+validate_root.yml
+- name: "V1 validate_root - frontend.binds ist eine nicht-leere Liste von Mappings"
+  ansible.builtin.assert:
+    that:
+      - haproxy_miw_customer_config.frontend.binds is sequence
+      - haproxy_miw_customer_config.frontend.binds is not string
+      - haproxy_miw_customer_config.frontend.binds | length > 0
+      - haproxy_miw_customer_config.frontend.binds | reject('mapping') | list | length == 0
+    fail_msg: >-
+      {{ haproxy_miw_customer_config_file }}: frontend.binds muss eine nicht-leere Liste von
+      Mappings sein (je Eintrag optional address, port, tls - fehlende Werte kommen aus
+      frontend.bind_defaults bzw. den Rollen-Defaults).
+
+---
+_frontend.j2
+{% for bind in haproxy_miw_model.frontend.binds %}
+    bind {{ bind.address }}:{{ bind.port }}{{ (' ssl crt ' ~ bind.tls.cert_path) if bind.tls.enabled else '' }}
+{% endfor %}
+
+---
+_server.j2
+{# Eine server-Zeile ohne Zeilenumbruch (liefert der Aufrufer), eingebunden aus _backends.j2 und _shared_backends.j2 (Loop-Variable member).
+   port: passthrough rendert den Server ohne Port - HAProxy verbindet dann auf den Port, auf dem
+   der Client ankam; der Health-Check braucht dafür check_port. #}
+    server {{ member.host }}_{{ member.port }} {{ member.host }}{{ '' if member.port == 'passthrough' else ':' ~ member.port }} weight {{ member.weight }}{% if member.check %} check{% if member.check_port %} port {{ member.check_port }}{% endif %}{% endif %}{% if member.tls.enabled %} ssl{% if not member.tls.verify %} verify none{% endif %}{% if member.tls.cert_path %} ca-file {{ member.tls.cert_path }}{% endif %}{% endif %}
